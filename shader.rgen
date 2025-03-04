@@ -1,0 +1,349 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+const float PI = 3.1415926535897932384626433832795;
+const bool jittered = true;
+const int SAMPLES = 4; //"sqrt" (ish) of total sample count per sample operation"
+
+const int MAX_REFR_DEPTH = 6;
+const int MAX_REFL_DEPTH = 3;
+
+const float t_min = 0.001;
+const float t_max = 10000.0;
+
+const int nbr_lamps = 2;
+const vec3[nbr_lamps] lampPositions = vec3[nbr_lamps](
+    vec3(-4.0,3.0,5.0),
+    vec3(5.0, 8.0, 2.5)
+);
+const float[nbr_lamps] lampSizes = float[nbr_lamps](0.6, 1.0);
+const float[nbr_lamps] lampStrengths = float[nbr_lamps](0.08,0.03);
+const vec3[nbr_lamps] lampColors = vec3[nbr_lamps](
+    vec3(0.2,0.45,1.0),
+    vec3(1.0,0.3,0.62)
+);
+const float lampFalloff = 0.01; 
+
+const vec3 backgroundColor = vec3(0.2,0.2,0.2);
+const float ambientStrength = 1.0;
+const vec3 ambientColor = backgroundColor; 
+
+struct Material {
+    vec3 color;
+    float reflectivity;
+    float refractivity;
+    float IOR;
+    float shininess;
+};
+
+struct RayPayload {
+    vec3 pos;
+    vec3 normal;
+    int anyhit;
+    Material material;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1, rgba8) uniform image2D image;
+layout(set = 0, binding = 2) uniform CameraUniforms {
+    mat4 view;
+    mat4 view_inv;
+    mat4 proj;
+    mat4 proj_inv;
+} camera;
+
+layout(location = 0) rayPayloadEXT RayPayload rayPayload;
+
+float diffuseFac(Material m) {
+    return max( 0.0, 1.0 - m.reflectivity - m.refractivity);
+}
+
+float random(float seed) {                                                                                                               
+     return fract(sin(seed) * 43758.5453123);                                                                                             
+}                                                                                                                                        
+                                                                                                                                          
+float randomRange(float seed, float minVal, float maxVal) {                                                                              
+     return mix(minVal, maxVal, random(seed));                                                                                            
+}  
+
+float pyramidDisribution(float seed, float a) { 
+    // Transfrom uniform distribution to triangle distribution with center in 0 and endpoints at +-a
+    //See Leo's notes for derivation, inverse cdf method
+    // Actually this is veery stupid, nvm it
+    float u = randomRange(seed, 0.0, 1.0); 
+    if (u>0.5) {
+        return (a - sqrt(2*a*a*(1-u)));
+    } else {
+        return (-a + sqrt(2*a*a*u));
+    }                                                                                                                                                               
+} 
+
+int getSamples(int max_samples, int depth) {
+    float invSampleFac = 1.0 + depth*0.;
+    return max(2, int((max_samples/invSampleFac)));
+}
+
+void makePerpendicular(vec3 vector, out vec3 perp1, out vec3 perp2) {
+        vec3 nonParallelTmp = abs(vector.x) > abs(vector.z) ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);                                                               
+        perp1 = normalize(cross(vector, nonParallelTmp));
+        perp2 = normalize(cross(vector, perp1)); 
+}
+
+void copyPay(in RayPayload pIn, out RayPayload pOut) {
+    pOut.pos = pIn.pos;
+    pOut.normal = pIn.normal;
+    pOut.anyhit = pIn.anyhit;
+    pOut.material = pIn.material;
+}
+
+void traceShadowRay(vec3 pos, vec3 dir, vec3 normal, bool getClosestHit) {
+    const float eps = 0.001;
+    uint ch_flag = getClosestHit ? gl_RayFlagsSkipClosestHitShaderEXT : 0;
+    traceRayEXT(scene, gl_RayFlagsOpaqueEXT | ch_flag |
+            gl_RayFlagsTerminateOnFirstHitEXT, 0xff, 0, 0, 0, pos.xyz + eps*normal, 
+            t_min, dir, t_max, 0);
+}
+
+vec3 traceAmbientRays(vec3 pos, vec3 tangent, vec3 binormal, vec3 normal, int depth) {
+    //theta goes around the normal, phi goes up to the normal (i.e phi = 0 perp to surf, phi = halfpi parallell to norm)
+    const int max_samplesTheta = int(1.5*SAMPLES);
+    const int max_samplesPhi = SAMPLES;
+    
+    // fewer samples the deeper in we are
+    int samplesTheta = getSamples(max_samplesTheta, depth);;
+    int samplesPhi = getSamples(max_samplesPhi, depth);
+    // samplesTheta = max_samplesTheta;
+    // samplesPhi = max_samplesPhi;
+    const float phi_range = 0.75*PI;
+    const float phi_offset = (PI - phi_range)/2.0;
+    const float dTheta = 2.0*PI/(samplesTheta);
+    const float dPhi= phi_range/(samplesPhi*2.0);
+
+
+    uint sky = 0;
+    for (uint i = 0; i<samplesTheta; i++) {
+        for (uint j = 0; j<samplesPhi; j++) {
+            rayPayload.anyhit = 1;
+
+            // Jitter samples
+            float phi = (j+0.5)*dPhi+phi_offset;
+            float theta = (i+0.5)*dTheta;
+            if (jittered) {
+                float seedRay = (i*samplesTheta)+j; //Unique seed for this ray
+                vec3 seedPos = (pos);
+                float seed = float(seedRay + (seedPos.x*seedPos.y+seedPos.z)); //'Unique' seed for ray AND this position
+                float randPhi = randomRange(2*seed, -dPhi*0.5, dPhi*0.5);
+                float randTheta = randomRange(2*seed+1, -dTheta*0.5, dTheta*0.5);
+                // float randPhi = pyramidDisribution(2*seed, dPhi);
+                // float randTheta = pyramidDisribution(2*seed+1, dTheta);
+                phi = phi + randPhi;
+                theta = theta + randTheta;
+            }
+
+            //Determine direction based on theta and phi, using our funky little TBN just created
+            vec3 dir = sin(phi)*normal + cos(phi)*cos(theta)*binormal + cos(phi)*sin(theta)*tangent;
+            
+            traceShadowRay(pos, dir, normal, false);
+
+            if (rayPayload.anyhit == 0) {
+                sky++;
+            }
+        }
+    }
+
+    //return ambient intensity
+    return (float(sky)/(samplesPhi*samplesTheta)) * ambientStrength * ambientColor;
+}
+
+vec3 traceLampRays(vec3 pos, vec3 normal, int idx, int depth) {
+    // see https://developer.nvidia.com/gpugems/gpugems2/part-ii-shading-lighting-and-shadows/chapter-17-efficient-soft-edged-shadows-using
+    // for the maths n stuff
+    const int max_samplesR = SAMPLES;
+    const int max_samplesTheta = int(1.5*SAMPLES);
+    
+    // fewer samples the deeper in we are
+    int samplesR = getSamples(max_samplesR, depth);
+    int samplesTheta = getSamples(max_samplesTheta, depth);;
+    // samplesR = max_samplesR;
+    // samplesTheta = max_samplesTheta;
+
+    float dR = (pow(lampSizes[idx],2.0))/samplesR;
+    float dTheta = 2.0*PI/samplesTheta;
+
+    int lampHits = 0;
+    vec3 generalDir = (lampPositions[idx] - pos);
+    float L = length(generalDir);
+    float intensity = 1/((lampFalloff*L*L+1.0));
+
+    for (int i = 0; i < samplesTheta; i++) {
+        for (int j = 0; j < samplesR; j++) {
+            
+            float theta = (i+0.5)*dTheta;
+            float r = (j+0.5)*dR;
+
+            if (jittered) {
+                float seedRay = (i*samplesTheta)+j; //Unique seed for this ray
+                vec3 seedPos = pos;
+                float seed = seedRay + (seedPos.x+seedPos.y+seedPos.z); //'Unique' seed for ray AND this position
+
+                theta += randomRange(2*seed, -dTheta*0.5, dTheta*0.5);
+                r += randomRange(2*seed+1, -dR*0.5, dR*0.5);
+                // theta += pyramidDisribution(2*seed, 2*dTheta);
+                // r += pyramidDisribution(2*seed, 2*dR);
+            }
+
+            float x = sqrt(r)*cos(theta);
+            float y = sqrt(r)*sin(theta);
+
+            vec3 u;
+            vec3 v;
+            makePerpendicular(generalDir, u, v);
+            vec3 dir = generalDir + x*u + y*v;
+            dir = normalize(dir);
+
+            rayPayload.anyhit = 1;
+            traceShadowRay(pos, dir, normal, true);
+            if (rayPayload.anyhit == 0) { //FIX
+                lampHits++;
+            } else if (length(rayPayload.pos-pos) > L) { //Blocking object further away than lamp
+                lampHits++;
+            }
+        } 
+    } 
+
+    // return abs(dot(generalDir, normal))*float(intensity*lampHits)/(samplesR*samplesTheta);
+    return (float(lampHits)/(samplesR*samplesTheta)) * lampColors[idx] * lampStrengths[idx] * intensity;
+
+}
+
+vec3 getDirectColor(vec3 pos, vec3 normal, vec3 orig, int anyhit, Material material, int depth) {
+    if(anyhit == 0) {
+        // No hit, write BG color
+        return backgroundColor;
+    } else {
+        vec3 binormal;
+        vec3 tangent;
+        makePerpendicular(normal, binormal, tangent);
+
+        vec3 ambientLight = traceAmbientRays(pos, tangent, binormal, normal, depth);
+        
+        vec3 diffuseSum = vec3(0.0);
+        vec3 specularSum = vec3(0.0);
+        for (int i = 0; i < nbr_lamps; i++) {
+            vec3 lampLight = (traceLampRays(pos, normal, i, depth));
+            vec3 lampDir = (lampPositions[i] - pos);
+            vec3 viewDir = (orig - pos);
+            float diffuse = max(dot(lampDir, normal),0);
+            float specular = max(0.0,dot(normalize(-viewDir), normalize(reflect(lampDir, normal))));
+            specular = pow(specular, material.shininess);
+
+            diffuseSum += diffuse * lampLight;
+            specularSum += specular * lampLight * min(material.shininess/8.0, 25.0); //somewhat arbitrary constants, looks better
+        }
+
+        // return vec3(0.5);
+        return specularSum + (diffuseSum + ambientLight) * material.color * diffuseFac(material);
+
+    }
+}
+
+
+void main()
+{
+    // Trace first ray into scene
+    const vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 in_uv = pixel_center / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d = in_uv * 2.0 - 1.0;
+
+    vec4 origin = camera.view_inv * vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 orig = origin.xyz;
+    vec4 target = camera.proj_inv * vec4(d.x, d.y, 1.0, 1.0);
+    vec4 direction = camera.view_inv * vec4(normalize(target.xyz), 0.0);
+    vec3 dir = direction.xyz;
+
+    //trace first ray, detect first intersection:
+    rayPayload.anyhit = 0;
+    traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, orig, 
+        t_min, dir, t_max, 0);
+
+    // Store payload values. rayPayload may be overwritten by a new trace before we have used these values.
+    RayPayload p;
+    copyPay(rayPayload, p);
+    
+    // Does this intersection have refraction. If yes, we will trace rays differently than otherwise.
+    // This value will stay the same for the entire tree.
+    bool isRefractTree = (p.material.refractivity > 0);
+    // For each intersection down the road, we also want to differentiatte between no refraction and refraction.
+    // This value will be updated after each intersection.
+    bool currentIntersectionHasRefraction;
+    bool currentIntersectionHasReflection;
+
+    vec3 resultColor = 
+        getDirectColor(p.pos, p.normal, orig, p.anyhit, p.material, 0);
+    
+    int MAXDEPTH = isRefractTree ? MAX_REFR_DEPTH : MAX_REFL_DEPTH;
+    float currentFac = 1.0; //keeps track of product all relevant reflectivity and refractivity factors above us in tree.
+
+    //Lets go down the three. 
+    for (int d = 0; d < MAXDEPTH; d++) {
+        
+        //break if no hit
+        if (p.anyhit == 0) {
+            break;
+        }
+
+        if (diffuseFac(p.material)>0.9999) {
+            break; //there is no more fun paths to go down
+        }
+
+        //go down the tree
+        currentIntersectionHasRefraction = (p.material.refractivity > 0.0);
+        currentIntersectionHasReflection = (p.material.reflectivity > 0.0);
+        vec3 view = orig-p.pos;
+
+        if ( currentIntersectionHasReflection) {
+            if (dot(view, p.normal) > 0) { //dont trace reflections from backfaces
+                vec3 direction = reflect(-normalize(view), normalize(p.normal)); //calculate reflection vector at this intersection
+                rayPayload.anyhit = 0;
+                traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, p.pos, 
+                t_min, direction, t_max, 0);
+                vec3 reflection = getDirectColor(rayPayload.pos, rayPayload.normal, p.pos, 
+                    rayPayload.anyhit, rayPayload.material, d);
+                resultColor += currentFac*p.material.reflectivity * reflection;
+            }
+        }
+        if (!currentIntersectionHasRefraction) {
+
+            currentFac *= p.material.reflectivity;
+            copyPay(rayPayload, p);; //we will continue down this path of this reflection
+
+        } else {
+            bool backfacing = (dot(view, p.normal) < 0);
+            float eta = !backfacing ? 1.0/p.material.IOR : p.material.IOR;
+            vec3 n = !backfacing ? p.normal : -p.normal;
+            n=normalize(n);
+            vec3 direction = refract(-normalize(view), normalize(n), eta); 
+
+            const float eps = 0.1;
+            rayPayload.anyhit = 0;
+            traceRayEXT(scene, gl_RayFlagsOpaqueEXT , 0xff, 0, 0, 0, p.pos-eps*n, 
+                t_min, direction, t_max, 0);
+            
+            vec3 refraction = getDirectColor(rayPayload.pos, rayPayload.normal, p.pos, 
+                rayPayload.anyhit, rayPayload.material, d);
+            resultColor += currentFac*p.material.refractivity * refraction * p.material.color;
+
+            currentFac *= p.material.refractivity;
+            copyPay(rayPayload, p); //we will continue down this path of this refraction          
+
+        }
+
+        orig = p.pos;
+        
+        // resultColor = vec3(float(d)/float(MAXDEPTH));
+
+    }
+
+    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(resultColor,1.0));
+}
